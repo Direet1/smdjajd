@@ -33,18 +33,9 @@ const PRICING: Record<string, ModelPricing> = {
 
   // ── Google Gemini ─────────────────────────────────────────────────────────
   "gemini-3.1-pro-preview":        { inputPer1M: 1.25,   outputPer1M: 10.00  },
-  "gemini-3-pro-preview":          { inputPer1M: 1.25,   outputPer1M: 10.00  },
-  "gemini-3-pro-image-preview":    { inputPer1M: 1.25,   outputPer1M: 120.00 },
-  "gemini-3-pro-image-preview-2k": { inputPer1M: 1.25,   outputPer1M: 120.00 },
   "gemini-3-flash-preview":        { inputPer1M: 0.15,   outputPer1M: 0.60   },
-  "gemini-3-flash-image-preview":  { inputPer1M: 0.15,   outputPer1M: 120.00 },
   "gemini-2.5-pro":                { inputPer1M: 1.25,   outputPer1M: 10.00  },
   "gemini-2.5-flash":              { inputPer1M: 0.15,   outputPer1M: 0.60   },
-  "gemini-2.0-pro":                { inputPer1M: 1.25,   outputPer1M: 10.00  },
-  "gemini-2.0-pro-exp":            { inputPer1M: 1.25,   outputPer1M: 10.00  },
-  "gemini-2.0-flash":              { inputPer1M: 0.10,   outputPer1M: 0.40   },
-  "gemini-2.0-flash-lite":         { inputPer1M: 0.075,  outputPer1M: 0.30   },
-  "gemini-2.0-flash-thinking":     { inputPer1M: 0.10,   outputPer1M: 0.40   },
 
   // ── OpenRouter ────────────────────────────────────────────────────────────
   "x-ai/grok-4.20":                { inputPer1M: 3.00,   outputPer1M: 15.00  },
