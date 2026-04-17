@@ -41,6 +41,8 @@ const GEMINI_MODELS: string[] = [];
 for (const b of GEMINI_BASE) {
   GEMINI_MODELS.push(b, `${b}-thinking`, `${b}-thinking-visible`);
 }
+// Image generation models (nano banana pro / nano banana)
+GEMINI_MODELS.push("gemini-3-pro-image-preview", "gemini-3-pro-image-preview-2k", "gemini-2.5-flash-image");
 
 const OPENROUTER_MODELS = [
   "x-ai/grok-4.20", "x-ai/grok-4.1-fast", "x-ai/grok-4-fast",

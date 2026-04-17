@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
 import { authMiddleware } from "../../middlewares/auth";
 import { isModelEnabled } from "../../lib/modelGroups";
 import { pushRequestLog, recordModelStat, makeReqStats, type ReqStats } from "../../lib/requestLog";
@@ -67,7 +67,7 @@ const anthropic = new Anthropic({
 
 const gemini = new GoogleGenAI({
   apiKey: process.env["AI_INTEGRATIONS_GEMINI_API_KEY"] ?? "dummy",
-  httpOptions: { baseUrl: process.env["AI_INTEGRATIONS_GEMINI_BASE_URL"] },
+  httpOptions: { apiVersion: "", baseUrl: process.env["AI_INTEGRATIONS_GEMINI_BASE_URL"] },
 });
 
 const openrouter = new OpenAI({
@@ -180,6 +180,10 @@ interface ChatBody {
   parallel_tool_calls?: boolean;
   // response_format
   response_format?: { type: string };
+  // image generation extensions (Gemini image models)
+  aspect_ratio?: string;  // e.g. "16:9", "9:16", "4:3", "3:4", "1:1"
+  negative_prompt?: string;
+  number_of_images?: number;  // alias for n, 1-4
 }
 
 const BEDROCK_PROMPT_CACHE_MODELS = new Set(["anthropic/claude-opus-4.6"]);
@@ -467,6 +471,26 @@ function stripGeminiSuffix(model: string): { baseModel: string; thinkingEnabled:
     return { baseModel: model.slice(0, -"-thinking".length), thinkingEnabled: true };
   }
   return { baseModel: model, thinkingEnabled: false };
+}
+
+const GEMINI_IMAGE_MODELS = new Set(["gemini-3-pro-image-preview", "gemini-3-pro-image-preview-2k", "gemini-2.5-flash-image"]);
+
+function isGeminiImageModel(model: string): boolean {
+  return GEMINI_IMAGE_MODELS.has(model);
+}
+
+// Extract text + image parts from a Gemini response and build a content string.
+// Images are encoded as markdown image tags with base64 data URIs.
+function extractGeminiContent(parts: Array<{ text?: string; inlineData?: { data?: string; mimeType?: string } }>): string {
+  const segments: string[] = [];
+  for (const part of parts) {
+    if (part.text) segments.push(part.text);
+    if (part.inlineData?.data) {
+      const mime = part.inlineData.mimeType ?? "image/png";
+      segments.push(`![generated image](data:${mime};base64,${part.inlineData.data})`);
+    }
+  }
+  return segments.join("\n\n");
 }
 
 // ----------------------------------------------------------------------
@@ -917,23 +941,45 @@ async function handleGeminiStream(
 
     sseWrite(res, makeChunk(id, model, { role: "assistant", content: "" }));
 
-    const stream = await gemini.models.generateContentStream({
-      model: baseModel,
-      contents,
-      config: config as Parameters<typeof gemini.models.generateContentStream>[0]["config"],
-    });
-
+    const imageModel = isGeminiImageModel(baseModel);
     let inputTokens = 0;
     let outputTokens = 0;
 
-    for await (const chunk of stream) {
-      const text = chunk.text;
-      if (text) {
-        sseWrite(res, makeChunk(id, model, { content: text }));
-      }
-      if (chunk.usageMetadata) {
-        inputTokens = chunk.usageMetadata.promptTokenCount ?? inputTokens;
-        outputTokens = chunk.usageMetadata.candidatesTokenCount ?? outputTokens;
+    if (imageModel) {
+      // Image models don't support streaming — use generateContent and send at once
+      config["responseModalities"] = [Modality.TEXT, Modality.IMAGE];
+      const numImages = body.number_of_images ?? body.n;
+      if (numImages && numImages > 1) config["numberOfImages"] = Math.min(numImages, 4);
+      if (body.aspect_ratio) config["aspectRatio"] = body.aspect_ratio;
+      if (body.negative_prompt) config["negativePrompt"] = body.negative_prompt;
+      const response = await gemini.models.generateContent({
+        model: baseModel,
+        contents,
+        config: config as Parameters<typeof gemini.models.generateContent>[0]["config"],
+      });
+      const allCandidates = response.candidates ?? [];
+      const content = allCandidates
+        .map(c => extractGeminiContent((c.content?.parts ?? []) as Array<{ text?: string; inlineData?: { data?: string; mimeType?: string } }>))
+        .filter(Boolean).join("\n\n");
+      if (content) sseWrite(res, makeChunk(id, model, { content }));
+      inputTokens = response.usageMetadata?.promptTokenCount ?? 0;
+      outputTokens = response.usageMetadata?.candidatesTokenCount ?? 0;
+    } else {
+      const stream = await gemini.models.generateContentStream({
+        model: baseModel,
+        contents,
+        config: config as Parameters<typeof gemini.models.generateContentStream>[0]["config"],
+      });
+
+      for await (const chunk of stream) {
+        const text = chunk.text;
+        if (text) {
+          sseWrite(res, makeChunk(id, model, { content: text }));
+        }
+        if (chunk.usageMetadata) {
+          inputTokens = chunk.usageMetadata.promptTokenCount ?? inputTokens;
+          outputTokens = chunk.usageMetadata.candidatesTokenCount ?? outputTokens;
+        }
       }
     }
 
@@ -985,13 +1031,27 @@ async function handleGeminiNonStream(
   if (systemInstruction) config["systemInstruction"] = systemInstruction;
   if (thinkingEnabled) config["thinkingConfig"] = { thinkingBudget: -1 };
 
+  const imageModel = isGeminiImageModel(baseModel);
+  if (imageModel) {
+    config["responseModalities"] = [Modality.TEXT, Modality.IMAGE];
+    const numImages = body.number_of_images ?? body.n;
+    if (numImages && numImages > 1) config["numberOfImages"] = Math.min(numImages, 4);
+    if (body.aspect_ratio) config["aspectRatio"] = body.aspect_ratio;
+    if (body.negative_prompt) config["negativePrompt"] = body.negative_prompt;
+  }
+
   const response = await gemini.models.generateContent({
     model: baseModel,
     contents,
     config: config as Parameters<typeof gemini.models.generateContent>[0]["config"],
   });
 
-  const text = response.text ?? "";
+  const candidates = response.candidates ?? [];
+  const text = imageModel
+    ? candidates.map(c =>
+        extractGeminiContent((c.content?.parts ?? []) as Array<{ text?: string; inlineData?: { data?: string; mimeType?: string } }>)
+      ).filter(Boolean).join("\n\n")
+    : (response.text ?? "");
   const inputTokens = response.usageMetadata?.promptTokenCount ?? 0;
   const outputTokens = response.usageMetadata?.candidatesTokenCount ?? 0;
   stats.promptTokens = inputTokens;
