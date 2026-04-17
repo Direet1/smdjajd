@@ -1,7 +1,7 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality, type Content, type Part } from "@google/genai";
 import { authMiddleware } from "../../middlewares/auth";
 import { isModelEnabled } from "../../lib/modelGroups";
 import { pushRequestLog, recordModelStat, makeReqStats, type ReqStats } from "../../lib/requestLog";
@@ -182,8 +182,15 @@ interface ChatBody {
   response_format?: { type: string };
   // image generation extensions (Gemini image models)
   aspect_ratio?: string;  // e.g. "16:9", "9:16", "4:3", "3:4", "1:1"
+  aspectRatio?: string;
   negative_prompt?: string;
   number_of_images?: number;  // alias for n, 1-4
+  image_size?: string;
+  imageSize?: string;
+  output_resolution?: string;
+  resolution?: string;
+  media_resolution?: string;
+  input_media_resolution?: string;
 }
 
 const BEDROCK_PROMPT_CACHE_MODELS = new Set(["anthropic/claude-opus-4.6"]);
@@ -479,6 +486,11 @@ function isGeminiImageModel(model: string): boolean {
   return GEMINI_IMAGE_MODELS.has(model);
 }
 
+function getGeminiBackendModel(model: string): string {
+  if (model === "gemini-3-pro-image-preview-2k") return "gemini-3-pro-image-preview";
+  return model;
+}
+
 // Extract text + image parts from a Gemini response and build a content string.
 // Images are encoded as markdown image tags with base64 data URIs.
 function extractGeminiContent(parts: Array<{ text?: string; inlineData?: { data?: string; mimeType?: string } }>): string {
@@ -497,22 +509,60 @@ function extractGeminiContent(parts: Array<{ text?: string; inlineData?: { data?
 // Message conversion: OpenAI -> Gemini
 // ----------------------------------------------------------------------
 
-type GeminiPart = { text: string };
-type GeminiContent = { role: "user" | "model"; parts: GeminiPart[] };
+type GeminiPart = Part;
+type GeminiContent = Content & { role: "user" | "model"; parts: GeminiPart[] };
 
-function oaiContentToGeminiParts(content: string | OAIContentPart[] | null): GeminiPart[] {
+function normalizeGeminiMediaResolution(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "low") return "MEDIA_RESOLUTION_LOW";
+  if (normalized === "medium") return "MEDIA_RESOLUTION_MEDIUM";
+  if (normalized === "high") return "MEDIA_RESOLUTION_HIGH";
+  if (normalized === "ultra_high" || normalized === "ultrahigh" || normalized === "2k" || normalized === "4k") {
+    return "MEDIA_RESOLUTION_ULTRA_HIGH";
+  }
+  return undefined;
+}
+
+function parseDataUri(dataUri: string): { mimeType: string; data: string } | undefined {
+  const match = dataUri.match(/^data:([^;,]+)(?:;[^,]*)?,(.+)$/s);
+  if (!match) return undefined;
+  return { mimeType: match[1] || "image/png", data: match[2] || "" };
+}
+
+function oaiContentToGeminiParts(content: string | OAIContentPart[] | null, defaultMediaResolution?: string): GeminiPart[] {
   if (!content) return [{ text: "" }];
   if (typeof content === "string") return [{ text: content }];
   const parts: GeminiPart[] = [];
   for (const part of content) {
     if (part.type === "text" && typeof (part as { text?: string }).text === "string") {
       parts.push({ text: (part as { text: string }).text });
+    } else if (part.type === "image_url") {
+      const imageUrl = (part as { image_url?: { url?: string; detail?: string } }).image_url;
+      const url = imageUrl?.url;
+      if (!url) continue;
+      const mediaResolution = normalizeGeminiMediaResolution(imageUrl.detail) ?? defaultMediaResolution;
+      const mediaResolutionPayload = mediaResolution ? { mediaResolution: { level: mediaResolution } } : {};
+      if (url.startsWith("data:")) {
+        const parsed = parseDataUri(url);
+        if (parsed?.data) {
+          parts.push({
+            inlineData: { data: parsed.data, mimeType: parsed.mimeType },
+            ...mediaResolutionPayload,
+          });
+        }
+      } else {
+        parts.push({
+          fileData: { fileUri: url, mimeType: "image/jpeg" },
+          ...mediaResolutionPayload,
+        });
+      }
     }
   }
   return parts.length > 0 ? parts : [{ text: "" }];
 }
 
-function convertMessagesToGemini(messages: OAIMessage[]): {
+function convertMessagesToGemini(messages: OAIMessage[], defaultMediaResolution?: string): {
   systemInstruction: string | undefined;
   contents: GeminiContent[];
 } {
@@ -532,7 +582,7 @@ function convertMessagesToGemini(messages: OAIMessage[]): {
       systemInstruction = systemInstruction ? `${systemInstruction}\n${text}` : text;
     } else {
       const role: "user" | "model" = msg.role === "assistant" ? "model" : "user";
-      const parts = oaiContentToGeminiParts(msg.content);
+      const parts = oaiContentToGeminiParts(msg.content, defaultMediaResolution);
       // Merge consecutive same-role messages into one to satisfy Gemini alternation rule
       const last = contents[contents.length - 1];
       if (last && last.role === role) {
@@ -549,6 +599,27 @@ function convertMessagesToGemini(messages: OAIMessage[]): {
   }
 
   return { systemInstruction, contents };
+}
+
+function normalizeGeminiImageSize(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toUpperCase().replace(/\s+/g, "");
+  if (normalized === "1K" || normalized === "1024" || normalized === "1024P") return "1K";
+  if (normalized === "2K" || normalized === "2048" || normalized === "2048P") return "2K";
+  if (normalized === "4K" || normalized === "4096" || normalized === "4096P") return "4K";
+  if (normalized === "512" || normalized === "512P") return "512";
+  return undefined;
+}
+
+function applyGeminiImageConfig(config: Record<string, unknown>, body: ChatBody, baseModel: string): void {
+  const imageConfig: Record<string, string> = {};
+  const aspectRatio = body.aspect_ratio ?? body.aspectRatio;
+  if (aspectRatio) imageConfig["aspectRatio"] = aspectRatio;
+  const explicitSize = body.image_size ?? body.imageSize ?? body.output_resolution ?? body.resolution;
+  const imageSize = normalizeGeminiImageSize(explicitSize) ?? (baseModel.endsWith("-2k") ? "2K" : undefined);
+  if (imageSize) imageConfig["imageSize"] = imageSize;
+  if (Object.keys(imageConfig).length > 0) config["imageConfig"] = imageConfig;
+  if (body.negative_prompt) config["negativePrompt"] = body.negative_prompt;
 }
 
 // ----------------------------------------------------------------------
@@ -919,7 +990,10 @@ async function handleGeminiStream(
 ) {
   const { model, max_tokens, temperature, top_p } = body;
   const { baseModel, thinkingEnabled } = stripGeminiSuffix(model);
-  const { systemInstruction, contents } = convertMessagesToGemini(body.messages);
+  const backendModel = getGeminiBackendModel(baseModel);
+  const resolvedMessages = await resolveImageUrls(body.messages);
+  const mediaResolution = normalizeGeminiMediaResolution(body.input_media_resolution ?? body.media_resolution);
+  const { systemInstruction, contents } = convertMessagesToGemini(resolvedMessages, mediaResolution);
 
   setSseHeaders(res);
   res.write(": init\n\n");
@@ -950,10 +1024,9 @@ async function handleGeminiStream(
       config["responseModalities"] = [Modality.TEXT, Modality.IMAGE];
       const numImages = body.number_of_images ?? body.n;
       if (numImages && numImages > 1) config["numberOfImages"] = Math.min(numImages, 4);
-      if (body.aspect_ratio) config["aspectRatio"] = body.aspect_ratio;
-      if (body.negative_prompt) config["negativePrompt"] = body.negative_prompt;
+      applyGeminiImageConfig(config, body, baseModel);
       const response = await gemini.models.generateContent({
-        model: baseModel,
+        model: backendModel,
         contents,
         config: config as Parameters<typeof gemini.models.generateContent>[0]["config"],
       });
@@ -966,7 +1039,7 @@ async function handleGeminiStream(
       outputTokens = response.usageMetadata?.candidatesTokenCount ?? 0;
     } else {
       const stream = await gemini.models.generateContentStream({
-        model: baseModel,
+        model: backendModel,
         contents,
         config: config as Parameters<typeof gemini.models.generateContentStream>[0]["config"],
       });
@@ -1021,7 +1094,10 @@ async function handleGeminiNonStream(
 ): Promise<Record<string, unknown>> {
   const { model, max_tokens, temperature, top_p } = body;
   const { baseModel, thinkingEnabled } = stripGeminiSuffix(model);
-  const { systemInstruction, contents } = convertMessagesToGemini(body.messages);
+  const backendModel = getGeminiBackendModel(baseModel);
+  const resolvedMessages = await resolveImageUrls(body.messages);
+  const mediaResolution = normalizeGeminiMediaResolution(body.input_media_resolution ?? body.media_resolution);
+  const { systemInstruction, contents } = convertMessagesToGemini(resolvedMessages, mediaResolution);
 
   const config: Record<string, unknown> = {
     maxOutputTokens: max_tokens ?? 8192,
@@ -1036,12 +1112,11 @@ async function handleGeminiNonStream(
     config["responseModalities"] = [Modality.TEXT, Modality.IMAGE];
     const numImages = body.number_of_images ?? body.n;
     if (numImages && numImages > 1) config["numberOfImages"] = Math.min(numImages, 4);
-    if (body.aspect_ratio) config["aspectRatio"] = body.aspect_ratio;
-    if (body.negative_prompt) config["negativePrompt"] = body.negative_prompt;
+    applyGeminiImageConfig(config, body, baseModel);
   }
 
   const response = await gemini.models.generateContent({
-    model: baseModel,
+    model: backendModel,
     contents,
     config: config as Parameters<typeof gemini.models.generateContent>[0]["config"],
   });
