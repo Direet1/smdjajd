@@ -12,10 +12,10 @@ version = "1.0.0"
 [[services]]
 name = "web"
 paths = [ "/" ]
-localPort = 3000
+localPort = 24927
 
 [services.development]
-run = "PORT=3000 BASE_PATH=/ pnpm --filter @workspace/api-portal run dev"
+run = "pnpm --filter @workspace/api-portal run dev"
 
 [services.production]
 build = [ "pnpm", "--filter", "@workspace/api-portal", "run", "build" ]
@@ -27,5 +27,5 @@ from = "/*"
 to = "/index.html"
 
 [services.env]
-PORT = "3000"
+PORT = "24927"
 BASE_PATH = "/"

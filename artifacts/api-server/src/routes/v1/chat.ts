@@ -475,6 +475,26 @@ function stripGeminiSuffix(model: string): { baseModel: string; thinkingEnabled:
 
 const GEMINI_IMAGE_MODELS = new Set(["gemini-3-pro-image-preview", "gemini-3-pro-image-preview-2k", "gemini-2.5-flash-image"]);
 
+// Aliases that map frontend-facing model names to the real Gemini API model name.
+// e.g. gemini-3-pro-image-preview-2k is a user-facing alias; the actual API model is gemini-3-pro-image-preview.
+const GEMINI_MODEL_ALIASES: Record<string, string> = {
+  "gemini-3-pro-image-preview-2k": "gemini-3-pro-image-preview",
+};
+
+// Extra imageGenerationConfig fields injected per alias.
+// imageSize: "1K" | "2K" | "4K" — controls pixel resolution of generated images.
+const GEMINI_MODEL_IMAGE_CONFIG: Record<string, Record<string, unknown>> = {
+  "gemini-3-pro-image-preview-2k": { imageSize: "2K" },
+};
+
+function resolveGeminiApiModel(model: string): string {
+  return GEMINI_MODEL_ALIASES[model] ?? model;
+}
+
+function getGeminiImageConfig(model: string): Record<string, unknown> {
+  return GEMINI_MODEL_IMAGE_CONFIG[model] ?? {};
+}
+
 function isGeminiImageModel(model: string): boolean {
   return GEMINI_IMAGE_MODELS.has(model);
 }
@@ -952,8 +972,10 @@ async function handleGeminiStream(
       if (numImages && numImages > 1) config["numberOfImages"] = Math.min(numImages, 4);
       if (body.aspect_ratio) config["aspectRatio"] = body.aspect_ratio;
       if (body.negative_prompt) config["negativePrompt"] = body.negative_prompt;
+      const aliasImageCfg = getGeminiImageConfig(model);
+      if (Object.keys(aliasImageCfg).length > 0) config["imageGenerationConfig"] = { ...aliasImageCfg };
       const response = await gemini.models.generateContent({
-        model: baseModel,
+        model: resolveGeminiApiModel(baseModel),
         contents,
         config: config as Parameters<typeof gemini.models.generateContent>[0]["config"],
       });
@@ -1038,10 +1060,12 @@ async function handleGeminiNonStream(
     if (numImages && numImages > 1) config["numberOfImages"] = Math.min(numImages, 4);
     if (body.aspect_ratio) config["aspectRatio"] = body.aspect_ratio;
     if (body.negative_prompt) config["negativePrompt"] = body.negative_prompt;
+    const aliasImageCfg = getGeminiImageConfig(model);
+    if (Object.keys(aliasImageCfg).length > 0) config["imageGenerationConfig"] = { ...aliasImageCfg };
   }
 
   const response = await gemini.models.generateContent({
-    model: baseModel,
+    model: resolveGeminiApiModel(baseModel),
     contents,
     config: config as Parameters<typeof gemini.models.generateContent>[0]["config"],
   });

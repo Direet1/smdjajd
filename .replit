@@ -9,6 +9,7 @@ args = ["pnpm", "store", "prune"]
 env = { "CI" = "true" }
 
 [workflows]
+runButton = "Project"
 
 [agent]
 stack = "PNPM_WORKSPACE"
@@ -19,10 +20,6 @@ path = "scripts/post-merge.sh"
 timeoutMs = 20000
 
 [[ports]]
-localPort = 3000
-externalPort = 3000
-
-[[ports]]
 localPort = 8080
 externalPort = 8080
 
@@ -30,7 +27,6 @@ externalPort = 8080
 localPort = 8081
 externalPort = 80
 
-[userenv]
-
-[userenv.shared]
-PROXY_API_KEY = "0110158"
+[[ports]]
+localPort = 24927
+externalPort = 3000
